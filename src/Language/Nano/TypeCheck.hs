@@ -34,17 +34,22 @@ class HasTVars a where
 -- | Type variables of a type
 instance HasTVars Type where
   freeTVars :: Type -> [TId]
-  freeTVars t     = error "TBD: type freeTVars"
+  freeTVars TInt = []
+  freeTVars TBool = []
+  freeTVars (TVar a) = [a]
+  freeTVars (TList t) = freeTVars t
+  freeTVars (t1 :=> t2) = L.nub (freeTVars t1 ++ freeTVars t2)
 
 -- | Free type variables of a poly-type (remove forall-bound vars)
 instance HasTVars Poly where
   freeTVars :: Poly -> [TId]
-  freeTVars s     = error "TBD: poly freeTVars"
+  freeTVars (Mono t) = freeTVars t
+  freeTVars (Forall t p) = L.delete t (freeTVars p)
 
 -- | Free type variables of a type environment
 instance HasTVars TypeEnv where
   freeTVars :: TypeEnv -> [TId]
-  freeTVars gamma   = concat [freeTVars s | (x, s) <- gamma]  
+  freeTVars gamma = L.nub (concat [freeTVars s | (x, s) <- gamma])  
   
 -- | Look up a variable in a type environment
 lookupVarType :: Id -> TypeEnv -> Poly
@@ -60,11 +65,13 @@ extendTypeEnv x s gamma = (x,s) : gamma
 -- | Look up a type variable in a substitution;
 --   if not present, return the variable unchanged
 lookupTVar :: TId -> Subst -> Type
-lookupTVar a sub = error "TBD: lookupTVar"
+lookupTVar a sub = case lookup a sub of
+  Just t  -> t
+  Nothing -> TVar a
 
 -- | Remove a type variable from a substitution
 removeTVar :: TId -> Subst -> Subst
-removeTVar a sub = error "TBD: removeTVar"
+removeTVar a sub = filter (\(x, _) -> x /= a) sub
      
 -- | Things to which type substitutions can be applied
 class Substitutable a where
@@ -73,12 +80,17 @@ class Substitutable a where
 -- | Apply substitution to type
 instance Substitutable Type where  
   apply :: Subst -> Type -> Type
-  apply sub t         = error "TBD: type apply"
+  apply _   TInt = TInt
+  apply _   TBool = TBool
+  apply sub (TVar a) = lookupTVar a sub
+  apply sub (TList t) = TList (apply sub t)
+  apply sub (t1 :=> t2) = apply sub t1 :=> apply sub t2
 
 -- | Apply substitution to poly-type
 instance Substitutable Poly where    
   apply :: Subst -> Poly -> Poly
-  apply sub s         = error "TBD: poly apply"
+  apply sub (Mono t)     = Mono (apply sub t)
+  apply sub (Forall a p) = Forall a (apply (removeTVar a sub) p)
 
 -- | Apply substitution to (all poly-types in) another substitution
 instance Substitutable Subst where  
@@ -96,7 +108,9 @@ instance Substitutable TypeEnv where
       
 -- | Extend substitution with a new type assignment
 extendSubst :: Subst -> TId -> Type -> Subst
-extendSubst sub a t = error "TBD: extendSubst"
+extendSubst sub a t = 
+  let t' = apply sub t
+  in (a, t') : apply [(a, t')] sub
       
 --------------------------------------------------------------------------------
 -- Problem 2: Unification
@@ -121,37 +135,87 @@ extendState (InferState sub n) a t = InferState (extendSubst sub a t) n
 -- | Unify a type variable with a type; 
 --   if successful return an updated state, otherwise throw an error
 unifyTVar :: InferState -> TId -> Type -> InferState
-unifyTVar st a t = error "TBD: unifyTVar"
+unifyTVar st a t 
+  | TVar a == t          = st
+  | L.elem a (freeTVars t) = throw (Error ("type error: cannot unify " ++ a ++ " and " ++ show t ++ " (occurs check)"))
+  | otherwise            = extendState st a t
     
 -- | Unify two types;
 --   if successful return an updated state, otherwise throw an error
 unify :: InferState -> Type -> Type -> InferState
-unify st t1 t2 = error "TBD: unify"
+unify st t1 t2 = unify' st (apply (stSub st) t1) (apply (stSub st) t2)
+  where
+    unify' st TInt TInt = st
+    unify' st TBool TBool = st
+    unify' st (TVar a) t = unifyTVar st a t
+    unify' st t (TVar a) = unifyTVar st a t
+    unify' st (TList l) (TList r) = unify st l r
+    unify' st (a1 :=> r1) (a2 :=> r2) = 
+      let st' = unify st a1 a2
+      in unify st' r1 r2
+    unify' _ ty1 ty2 = throw (Error ("type error: cannot unify " ++ show ty1 ++ " and " ++ show ty2))
 
 --------------------------------------------------------------------------------
 -- Problem 3: Type Inference
 --------------------------------------------------------------------------------    
   
 infer :: InferState -> TypeEnv -> Expr -> (InferState, Type)
-infer st _   (EInt _)          = error "TBD: infer EInt"
-infer st _   (EBool _)         = error "TBD: infer EBool"
-infer st gamma (EVar x)        = error "TBD: infer EVar"
-infer st gamma (ELam x body)   = error "TBD: infer ELam"
-infer st gamma (EApp e1 e2)    = error "TBD: infer EApp"
-infer st gamma (ELet x e1 e2)  = error "TBD: infer ELet"
-infer st gamma (EBin op e1 e2) = infer st gamma asApp
+infer st _ (EInt _) = (st, TInt)
+infer st _ (EBool _) = (st, TBool)
+
+infer st gamma (EVar x) = 
+  let (n', t) = instantiate (stCnt st) (lookupVarType x gamma)
+  in (st { stCnt = n' }, t)
+
+infer st gamma (ELam x body) =
+  let a = freshTV (stCnt st)
+      gamma' = extendTypeEnv x (Mono a) gamma
+      (st', tBody) = infer (st { stCnt = stCnt st + 1 }) gamma' body
+  in (st', apply (stSub st') (a :=> tBody))
+
+infer st gamma (EApp e1 e2) =
+  let (st1, t1) = infer st gamma e1
+      (st2, t2) = infer st1 (apply (stSub st1) gamma) e2
+      a = freshTV (stCnt st2)
+      -- No need to manually apply substitution here anymore!
+      st3 = unify (st2 { stCnt = stCnt st2 + 1 }) t1 (t2 :=> a) 
+  in (st3, apply (stSub st3) a)
+
+infer st gamma (ELet x e1 e2) =
+  let a = freshTV (stCnt st)
+      gammaRec = extendTypeEnv x (Mono a) gamma
+      (st1, t1) = infer (st { stCnt = stCnt st + 1 }) gammaRec e1
+      -- Cleaned up unify call here as well!
+      st2 = unify st1 t1 a 
+      t1' = apply (stSub st2) t1
+      gamma' = apply (stSub st2) gamma
+      poly = generalize gamma' t1'
+      (st3, t2) = infer st2 (extendTypeEnv x poly gamma') e2
+  in (st3, t2)
+
+infer st gamma (EBin op e1 e2) = infer st gamma (EApp (EApp (EVar (opName op)) e1) e2)
   where
-    asApp = EApp (EApp opVar e1) e2
-    opVar = EVar (show op)
-infer st gamma (EIf c e1 e2) = infer st gamma asApp
-  where
-    asApp = EApp (EApp (EApp ifVar c) e1) e2
-    ifVar = EVar "if"    
+    opName Plus  = "+"
+    opName Minus = "-"
+    opName Mul   = "*"
+    opName Eq    = "=="
+    opName Ne    = "!="
+    opName Lt    = "<"
+    opName Le    = "<="
+    opName And   = "&&"
+    opName Or    = "||"
+    opName Cons  = ":"
+    opName _     = error "unsupported operator"
+    
+infer st gamma (EIf cond e1 e2) = infer st gamma (EApp (EApp (EApp (EVar "if") cond) e1) e2)
+
 infer st gamma ENil = infer st gamma (EVar "[]")
 
 -- | Generalize type variables inside a type
 generalize :: TypeEnv -> Type -> Poly
-generalize gamma t = error "TBD: generalize"
+generalize gamma t = L.foldr Forall (Mono t) vars
+  where
+    vars = L.nub (freeTVars t) L.\\ L.nub (freeTVars gamma)
     
 -- | Instantiate a polymorphic type into a mono-type with fresh type variables
 instantiate :: Int -> Poly -> (Int, Type)
@@ -165,19 +229,18 @@ instantiate n s = helper n [] s
 preludeTypes :: TypeEnv
 preludeTypes =
   [ ("+",    Mono (TInt :=> TInt :=> TInt))
-  , ("-",    error "TBD: -")
-  , ("*",    error "TBD: *")
-  , ("/",    error "TBD: /")
-  , ("==",   error "TBD: ==")
-  , ("!=",   error "TBD: !=")
-  , ("<",    error "TBD: <")
-  , ("<=",   error "TBD: <=")
-  , ("&&",   error "TBD: &&")
-  , ("||",   error "TBD: ||")
-  , ("if",   error "TBD: if")
-  -- lists: 
-  , ("[]",   error "TBD: []")
-  , (":",    error "TBD: :")
-  , ("head", error "TBD: head")
-  , ("tail", error "TBD: tail")
+  , ("-",    Mono (TInt :=> TInt :=> TInt))
+  , ("*",    Mono (TInt :=> TInt :=> TInt))
+  , ("/",    Mono (TInt :=> TInt :=> TInt))
+  , ("==",   Forall "a" (Mono (TVar "a" :=> TVar "a" :=> TBool)))
+  , ("!=",   Forall "a" (Mono (TVar "a" :=> TVar "a" :=> TBool)))
+  , ("<",    Mono (TInt :=> TInt :=> TBool))
+  , ("<=",   Mono (TInt :=> TInt :=> TBool))
+  , ("&&",   Mono (TBool :=> TBool :=> TBool))
+  , ("||",   Mono (TBool :=> TBool :=> TBool))
+  , ("if",   Forall "a" (Mono (TBool :=> TVar "a" :=> TVar "a" :=> TVar "a")))
+  , ("[]",   Forall "a" (Mono (TList (TVar "a"))))
+  , (":",    Forall "a" (Mono (TVar "a" :=> TList (TVar "a") :=> TList (TVar "a"))))
+  , ("head", Forall "a" (Mono (TList (TVar "a") :=> TVar "a")))
+  , ("tail", Forall "a" (Mono (TList (TVar "a") :=> TList (TVar "a"))))
   ]

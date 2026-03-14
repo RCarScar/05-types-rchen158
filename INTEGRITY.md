@@ -1,0 +1,1 @@
+used outside resources to study syntax no directly copied unique code.
